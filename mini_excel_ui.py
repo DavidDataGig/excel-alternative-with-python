@@ -1,11 +1,20 @@
 """
 MiniExcel UI — high-performance ipywidgets spreadsheet.
 
-Key design: a fixed *widget pool* is instantiated once per `_render_grid` call
-(triggered only on structural changes such as config edits or data loads).
-Page navigation calls the much cheaper `_update_page_data`, which only mutates
-`.value` / `.options` / `layout.display` on existing widgets — zero new objects
-are created, so the kernel↔frontend Comm channel stays quiet.
+Two rendering modes depending on how data was loaded:
+
+  Engine mode  (paste / load_sample)
+      The Spreadsheet engine owns all data.  Widget pool shows engine values.
+
+  DataFrame mode  (Load CSV / Load XLSX buttons)
+      pandas reads the full file in ~2 s.  The engine only holds the small
+      number of columns the user has explicitly enabled for editing.
+      Read-only cells are rendered straight from the DataFrame — zero engine
+      calls, so page turns are instant regardless of file size.
+
+      _df          — full pandas DataFrame (source of truth for raw data)
+      _edit_overlay — {(abs_row, col): raw_str} for user edits on any page
+      sheet         — Spreadsheet engine, page-local coords (row 0 = page start)
 """
 
 from __future__ import annotations
@@ -15,17 +24,17 @@ import io
 from typing import Any
 
 import ipywidgets as widgets
+import pandas as pd
 from IPython.display import display
 
 from spreadsheet_engine import (
-    FormulaError,  # noqa: F401 — re-exported for convenience
+    FormulaError,  # noqa: F401
     Spreadsheet,
     col_index,
     col_letter,
     rc_to_a1,
 )
 
-# (HBox row container, row-number label, ordered list of cell widgets for each column)
 _PoolRow = tuple[widgets.HBox, widgets.Label, list[widgets.Widget]]
 
 
@@ -33,10 +42,9 @@ class MiniExcelUI:
     """
     Spreadsheet UI backed by a static widget pool.
 
-    Structural operations (load, config change, col/row insert/delete, page-size
-    change) call `_render_grid`, which rebuilds the pool once.  Pagination calls
-    `_update_page_data`, which runs in O(page_size × cols) attribute assignments
-    with no widget allocation.
+    Page navigation never creates widgets.  In DataFrame mode the engine is
+    bypassed entirely for read-only columns, so even million-row files paginate
+    instantly.
     """
 
     _FREEZE_CSS = """
@@ -57,7 +65,7 @@ class MiniExcelUI:
 </style>
 """
 
-    def __init__(self, rows: int = 12, cols: int = 8) -> None:
+    def __init__(self, rows: int = 20, cols: int = 10) -> None:
         self.sheet = Spreadsheet(rows, cols)
         self.selected: tuple[int, int] = (0, 0)
         self._programmatic_update = False
@@ -73,13 +81,120 @@ class MiniExcelUI:
         self.grid_height = 400
         self.auto_save = False
 
-        # Widget pool state — rebuilt by _render_grid, reused by _update_page_data
+        # DataFrame mode state
+        self._df: pd.DataFrame | None = None          # full file in memory
+        self._edit_overlay: dict[tuple[int, int], str] = {}  # user edits by abs coords
+
+        # Widget pool
         self._pool_rows: list[_PoolRow] = []
         self.col_header_widgets: dict[int, widgets.Label] = {}
         self._frozen_row_labels: dict[int, widgets.Label] = {}
         self._frozen_row_hbox: widgets.HBox | None = None
 
         self._build()
+
+    # ── Mode helpers ───────────────────────────────────────────────────────
+
+    @property
+    def _df_mode(self) -> bool:
+        """True when a file has been loaded via pandas (DataFrame mode)."""
+        return self._df is not None
+
+    def _n_rows(self) -> int:
+        """Total row count across all pages."""
+        return len(self._df) if self._df_mode else self.sheet.rows
+
+    def _n_cols(self) -> int:
+        return self.sheet.cols
+
+    # ── Central display / raw accessors ───────────────────────────────────
+
+    def _get_display(self, pool_idx: int, abs_row: int, col: int) -> str:
+        """
+        Return the display string for one cell.
+
+        DataFrame mode: editable cols come from the engine (formula-aware);
+        read-only cols come straight from the DataFrame.
+        Engine mode: always use the engine.
+        """
+        if self._df_mode:
+            if col in self.editable_cols:
+                return self.sheet.get_display(pool_idx, col)
+            val = self._edit_overlay.get((abs_row, col))
+            if val is not None:
+                return val
+            if abs_row < len(self._df) and col < self._df.shape[1]:
+                return str(self._df.iloc[abs_row, col])
+            return ""
+        return self.sheet.get_display(abs_row, col)
+
+    def _get_raw(self, pool_idx: int, abs_row: int, col: int) -> str:
+        """Return raw / formula text for the formula bar."""
+        if self._df_mode:
+            if col in self.editable_cols:
+                return self.sheet.get_raw(pool_idx, col)
+            val = self._edit_overlay.get((abs_row, col))
+            if val is not None:
+                return val
+            if abs_row < len(self._df) and col < self._df.shape[1]:
+                return str(self._df.iloc[abs_row, col])
+            return ""
+        return self.sheet.get_raw(abs_row, col)
+
+    def _set_cell(self, pool_idx: int, abs_row: int, col: int,
+                  val: str, record_history: bool = True) -> None:
+        """Write a value, routing to the right storage backend."""
+        if self._df_mode:
+            if val:
+                self._edit_overlay[(abs_row, col)] = val
+            else:
+                self._edit_overlay.pop((abs_row, col), None)
+            self.sheet.set_cell(pool_idx, col, val, record_history=record_history)
+        else:
+            self.sheet.set_cell(abs_row, col, val, record_history=record_history)
+
+    # ── Engine ↔ DataFrame sync ────────────────────────────────────────────
+
+    def _load_col_into_engine(self, col: int) -> None:
+        """Load one column's data for the current page into the engine."""
+        if not self._df_mode:
+            return
+        row_start = self.page * self.page_size
+        row_end   = min(row_start + self.page_size, len(self._df))
+        for pool_idx in range(row_end - row_start):
+            abs_row = row_start + pool_idx
+            val = self._edit_overlay.get((abs_row, col),
+                  str(self._df.iloc[abs_row, col]) if abs_row < len(self._df) else "")
+            if val:
+                self.sheet.set_cell(pool_idx, col, val, record_history=False)
+
+    def _load_page_into_engine(self) -> None:
+        """Reinitialise engine with current page's editable-column data."""
+        if not self._df_mode:
+            return
+        self.sheet = Spreadsheet(self.page_size, self._n_cols())
+        for c in self.editable_cols:
+            self._load_col_into_engine(c)
+
+    def _flush_col_edits(self, col: int) -> None:
+        """Persist engine edits for one column of the current page to the overlay."""
+        if not self._df_mode:
+            return
+        row_start = self.page * self.page_size
+        row_end   = min(row_start + self.page_size, len(self._df))
+        for pool_idx in range(row_end - row_start):
+            abs_row = row_start + pool_idx
+            raw = self.sheet.get_raw(pool_idx, col)
+            df_val = str(self._df.iloc[abs_row, col]) if abs_row < len(self._df) else ""
+            if raw and raw != df_val:
+                self._edit_overlay[(abs_row, col)] = raw
+            elif not raw:
+                self._edit_overlay.pop((abs_row, col), None)
+
+    def _flush_page_edits(self) -> None:
+        """Persist all editable columns of the current page to the overlay."""
+        for c in self.editable_cols:
+            self._flush_col_edits(c)
 
     # ── Layout helpers ─────────────────────────────────────────────────────
 
@@ -97,7 +212,6 @@ class MiniExcelUI:
         )
 
     def _apply_col_width(self, c: int, px: int) -> None:
-        """Update column width on all live pool widgets without a full rebuild."""
         w_str = f"{px}px"
         if c in self.col_header_widgets:
             h = self.col_header_widgets[c]
@@ -111,7 +225,6 @@ class MiniExcelUI:
                 w.layout.width = w.layout.min_width = w_str
 
     def _apply_col_visibility(self, c: int, hidden: bool) -> None:
-        """Show or hide a column across header, frozen row, and pool."""
         val = "none" if hidden else ""
         if c in self.col_header_widgets:
             self.col_header_widgets[c].layout.display = val
@@ -121,7 +234,7 @@ class MiniExcelUI:
             if c < len(cell_pool):
                 cell_pool[c].layout.display = val
 
-    # ── One-time UI construction ───────────────────────────────────────────
+    # ── UI construction ────────────────────────────────────────────────────
 
     def _build(self) -> None:
         """Create all toolbar widgets and scroll wrapper. Called once at init."""
@@ -140,7 +253,7 @@ class MiniExcelUI:
              self.input_area, self.load_btn]
         )
 
-        # Row 1 — save
+        # Row 1 — file I/O
         self.path_input = widgets.Text(
             value="miniexcel_output",
             placeholder="filename (no extension)",
@@ -178,11 +291,11 @@ class MiniExcelUI:
 
         self.undo_btn    = _btn("Undo", icon="undo",    layout=widgets.Layout(width="90px"))
         self.redo_btn    = _btn("Redo", icon="redo",    layout=widgets.Layout(width="90px"))
-        self.ins_row_btn = _btn("+Row", tooltip="Insert row above selected",   layout=widgets.Layout(width="70px"))
-        self.del_row_btn = _btn("-Row", tooltip="Delete selected row",         layout=widgets.Layout(width="70px"))
+        self.ins_row_btn = _btn("+Row", tooltip="Insert row above selected",     layout=widgets.Layout(width="70px"))
+        self.del_row_btn = _btn("-Row", tooltip="Delete selected row",           layout=widgets.Layout(width="70px"))
         self.ins_col_btn = _btn("+Col", tooltip="Insert column before selected", layout=widgets.Layout(width="70px"))
-        self.del_col_btn = _btn("-Col", tooltip="Delete selected column",      layout=widgets.Layout(width="70px"))
-        self.clear_btn   = _btn("Clear All", button_style="warning",           layout=widgets.Layout(width="100px"))
+        self.del_col_btn = _btn("-Col", tooltip="Delete selected column",        layout=widgets.Layout(width="70px"))
+        self.clear_btn   = _btn("Clear All", button_style="warning",             layout=widgets.Layout(width="100px"))
         self.undo_btn.on_click(self._on_undo)
         self.redo_btn.on_click(self._on_redo)
         self.ins_row_btn.on_click(self._on_ins_row)
@@ -349,7 +462,7 @@ class MiniExcelUI:
     # ── Pagination ─────────────────────────────────────────────────────────
 
     def _total_pages(self) -> int:
-        return max(1, -(-self.sheet.rows // self.page_size))
+        return max(1, -(-self._n_rows() // self.page_size))
 
     def _update_page_indicator(self) -> None:
         total = self._total_pages()
@@ -360,19 +473,32 @@ class MiniExcelUI:
     def _on_prev_page(self, _: Any) -> None:
         if self.page > 0:
             self._auto_save()
+            if self._df_mode:
+                self._flush_page_edits()
             self.page -= 1
-            self._update_page_data()   # ← fast path: values only
+            if self._df_mode:
+                self._load_page_into_engine()
+            self._update_page_data()
 
     def _on_next_page(self, _: Any) -> None:
         if self.page < self._total_pages() - 1:
             self._auto_save()
+            if self._df_mode:
+                self._flush_page_edits()
             self.page += 1
-            self._update_page_data()   # ← fast path: values only
+            if self._df_mode:
+                self._load_page_into_engine()
+            self._update_page_data()
 
     def _on_page_size_change(self, change: dict) -> None:
+        if self._df_mode:
+            self._flush_page_edits()
         self.page_size = change["new"]
         self.page = 0
-        self._render_grid()            # pool size changes → full rebuild
+        if self._df_mode:
+            self.sheet = Spreadsheet(self.page_size, self._n_cols())
+            self._load_page_into_engine()
+        self._render_grid()
 
     # ── Auto-save ──────────────────────────────────────────────────────────
 
@@ -390,7 +516,7 @@ class MiniExcelUI:
             return
         fmt  = self.auto_save_fmt.value
         path = (self.path_input.value or "miniexcel_output") + "." + fmt.lower()
-        self.sheet.save_csv(path) if fmt == "CSV" else self.sheet.save_xlsx(path)
+        self._do_save(path, fmt)
         self.auto_save_status.value = f"Auto-saved → {path}"
         self._set_status(f"Auto-saved → {path}")
 
@@ -424,25 +550,37 @@ class MiniExcelUI:
 
     def _on_enable_col_edit(self, _: Any) -> None:
         c = self._parse_col_input(self.ce_col_input)
-        if c is None: return
+        if c is None:
+            return
         self.editable_cols.add(c)
+        if self._df_mode:
+            self._load_col_into_engine(c)
         self._render_grid()
         self._set_status(f"Column {col_letter(c)} is now editable.")
 
     def _on_disable_col_edit(self, _: Any) -> None:
         c = self._parse_col_input(self.ce_col_input)
-        if c is None: return
+        if c is None:
+            return
+        if self._df_mode and c in self.editable_cols:
+            self._flush_col_edits(c)
         self.editable_cols.discard(c)
         self._render_grid()
         self._set_status(f"Column {col_letter(c)} is now read-only.")
 
     def _on_enable_all_cols(self, _: Any) -> None:
-        self.editable_cols = set(range(self.sheet.cols))
+        self.editable_cols = set(range(self._n_cols()))
+        if self._df_mode:
+            self._load_page_into_engine()
         self._render_grid()
         self._set_status("All columns are now editable.")
 
     def _on_disable_all_cols(self, _: Any) -> None:
+        if self._df_mode:
+            self._flush_page_edits()
         self.editable_cols.clear()
+        if self._df_mode:
+            self.sheet = Spreadsheet(self.page_size, self._n_cols())
         self._render_grid()
         self._set_status("All columns are now read-only.")
 
@@ -450,20 +588,19 @@ class MiniExcelUI:
 
     def _render_grid(self) -> None:
         """
-        Rebuild the entire widget pool.  Expensive — only called on structural
-        changes (config edits, data load, col/row mutations, page-size change).
+        Rebuild the widget pool.  Expensive — only on structural changes.
         Pagination uses _update_page_data instead.
         """
         row_start   = self.page * self.page_size
-        row_end     = min(row_start + self.page_size, self.sheet.rows)
+        row_end     = min(row_start + self.page_size, self._n_rows())
         num_visible = row_end - row_start
         row_layout  = widgets.Layout(flex_flow="row nowrap")
 
-        # ── Column-letter header row ───────────────────────────────────────
+        # Column-letter header
         corner = widgets.Label(value="", layout=self._fixed40())
         self.col_header_widgets.clear()
         header_cells: list[widgets.Widget] = [corner]
-        for c in range(self.sheet.cols):
+        for c in range(self._n_cols()):
             cw = self._col_w(c)
             h = widgets.Label(
                 value=col_letter(c),
@@ -475,13 +612,13 @@ class MiniExcelUI:
         if self.freeze_top:
             header_row.add_class("mini-excel-freeze-header")
 
-        # ── Frozen copy of data-row 0 (shown when freeze_top and page > 0) ─
+        # Frozen copy of row 0 (sticky on page 2+)
         self._frozen_row_labels.clear()
         pin_cells: list[widgets.Widget] = [widgets.Label(value="1", layout=self._fixed40())]
-        for c in range(self.sheet.cols):
+        for c in range(self._n_cols()):
             cw = self._col_w(c)
             lbl = widgets.Label(
-                value=self.sheet.get_display(0, c),
+                value=self._get_display(0, 0, c),
                 layout=widgets.Layout(
                     width=cw, min_width=cw, flex="0 0 auto",
                     border="1px solid #ccc", background_color="#fffde7",
@@ -491,27 +628,26 @@ class MiniExcelUI:
             self._frozen_row_labels[c] = lbl
         self._frozen_row_hbox = widgets.HBox(pin_cells, layout=row_layout)
         self._frozen_row_hbox.add_class("mini-excel-freeze-row1")
-        # Shown/hidden by _update_page_data; start in the correct state
         self._frozen_row_hbox.layout.display = (
-            "" if (self.freeze_top and self.page > 0 and self.sheet.rows > 0) else "none"
+            "" if (self.freeze_top and self.page > 0 and self._n_rows() > 0) else "none"
         )
 
-        # ── Widget pool (page_size slots) ──────────────────────────────────
+        # Widget pool
         self._pool_rows = []
         for pool_idx in range(self.page_size):
-            r       = row_start + pool_idx
+            abs_row = row_start + pool_idx
             visible = pool_idx < num_visible
 
             rn_label = widgets.Label(
-                value=str(r + 1) if visible else "",
+                value=str(abs_row + 1) if visible else "",
                 layout=self._fixed40(),
             )
             cell_pool: list[widgets.Widget] = []
             row_cells: list[widgets.Widget] = [rn_label]
 
-            for c in range(self.sheet.cols):
-                current_val = self.sheet.get_display(r, c) if visible else ""
-                layout      = self._cell_layout(c)
+            for c in range(self._n_cols()):
+                current_val = self._get_display(pool_idx, abs_row, c) if visible else ""
+                layout = self._cell_layout(c)
 
                 if c in self.editable_cols:
                     if c in self.col_dropdowns:
@@ -528,7 +664,7 @@ class MiniExcelUI:
                         w = widgets.Text(
                             value=current_val, layout=layout, continuous_update=False
                         )
-                    w._coords = (r, c)  # type: ignore[attr-defined]
+                    w._coords = (abs_row, c)  # type: ignore[attr-defined]
                     w.observe(self._on_cell_change, names="value")
                 else:
                     w = widgets.Label(
@@ -539,7 +675,7 @@ class MiniExcelUI:
                             background_color="#fafafa",
                         ),
                     )
-                    w._coords = (r, c)  # type: ignore[attr-defined]
+                    w._coords = (abs_row, c)  # type: ignore[attr-defined]
 
                 cell_pool.append(w)
                 row_cells.append(w)
@@ -547,13 +683,11 @@ class MiniExcelUI:
             data_row = widgets.HBox(row_cells, layout=row_layout)
             if not visible:
                 data_row.layout.display = "none"
-            # Pin data-row 0 only when freeze is on and we are on page 0
             if pool_idx == 0 and self.page == 0 and self.freeze_top:
                 data_row.add_class("mini-excel-freeze-row1")
 
             self._pool_rows.append((data_row, rn_label, cell_pool))
 
-        # ── Assemble grid ──────────────────────────────────────────────────
         all_rows: list[widgets.Widget] = [header_row, self._frozen_row_hbox]
         all_rows.extend(hbox for hbox, _, _ in self._pool_rows)
         self.grid_box.children = all_rows
@@ -568,25 +702,25 @@ class MiniExcelUI:
     def _update_page_data(self) -> None:
         """
         Update widget values for the new page without creating any widgets.
-        Only `.value`, `.options`, and `layout.display` are mutated.
+        In DataFrame mode, read-only cells come straight from the DataFrame.
         """
         row_start   = self.page * self.page_size
-        row_end     = min(row_start + self.page_size, self.sheet.rows)
+        row_end     = min(row_start + self.page_size, self._n_rows())
         num_visible = row_end - row_start
 
         self._programmatic_update = True
         try:
-            # Show/hide frozen header copy
+            # Frozen header copy
             if self._frozen_row_hbox is not None:
-                show_frozen = self.freeze_top and self.page > 0 and self.sheet.rows > 0
+                show_frozen = self.freeze_top and self.page > 0 and self._n_rows() > 0
                 self._frozen_row_hbox.layout.display = "" if show_frozen else "none"
                 if show_frozen:
                     for c, lbl in self._frozen_row_labels.items():
-                        nd = self.sheet.get_display(0, c)
+                        nd = self._get_display(0, 0, c)
                         if lbl.value != nd:
                             lbl.value = nd
 
-            # Manage freeze class on pool row 0
+            # Freeze class on first pool row
             if self._pool_rows:
                 first_hbox = self._pool_rows[0][0]
                 if self.page == 0 and self.freeze_top:
@@ -594,20 +728,19 @@ class MiniExcelUI:
                 else:
                     first_hbox.remove_class("mini-excel-freeze-row1")
 
-            # Update each pool slot
             for pool_idx, (data_row, rn_label, cell_pool) in enumerate(self._pool_rows):
-                r       = row_start + pool_idx
+                abs_row = row_start + pool_idx
                 visible = pool_idx < num_visible
 
                 data_row.layout.display = "" if visible else "none"
                 if not visible:
                     continue
 
-                rn_label.value = str(r + 1)
+                rn_label.value = str(abs_row + 1)
 
                 for c, w in enumerate(cell_pool):
-                    w._coords = (r, c)  # type: ignore[attr-defined]
-                    nd = self.sheet.get_display(r, c)
+                    w._coords = (abs_row, c)  # type: ignore[attr-defined]
+                    nd = self._get_display(pool_idx, abs_row, c)
 
                     if isinstance(w, widgets.Label):
                         if w.value != nd:
@@ -634,25 +767,28 @@ class MiniExcelUI:
         if self._programmatic_update:
             return
         w: Any = change["owner"]
-        r, c = w._coords
-        self.selected = (r, c)
-        self.cell_label.value = rc_to_a1(r, c)
-        self.sheet.set_cell(r, c, change["new"])
+        abs_row, col = w._coords
+        pool_idx = abs_row - self.page * self.page_size
+        self.selected = (abs_row, col)
+        self.cell_label.value = rc_to_a1(abs_row, col)
+        self._set_cell(pool_idx, abs_row, col, change["new"])
         self._refresh_visible_cells()
         self._programmatic_update = True
-        self.formula_bar.value = self.sheet.get_raw(r, c)
+        self.formula_bar.value = self._get_raw(pool_idx, abs_row, col)
         self._programmatic_update = False
         self._set_status(
-            f"Set {rc_to_a1(r, c)} = {self.sheet.get_raw(r, c)!r} → {self.sheet.get_display(r, c)}"
+            f"Set {rc_to_a1(abs_row, col)} = {change['new']!r} → "
+            f"{self._get_display(pool_idx, abs_row, col)}"
         )
 
     def _on_formula_bar_change(self, change: dict) -> None:
         if self._programmatic_update:
             return
-        r, c = self.selected
-        if c not in self.editable_cols:
+        abs_row, col = self.selected
+        if col not in self.editable_cols:
             return
-        self.sheet.set_cell(r, c, change["new"])
+        pool_idx = abs_row - self.page * self.page_size
+        self._set_cell(pool_idx, abs_row, col, change["new"])
         self._refresh_visible_cells()
 
     def _refresh_visible_cells(self, *, skip_selected: bool = True) -> None:
@@ -661,15 +797,15 @@ class MiniExcelUI:
         self._programmatic_update = True
         try:
             for c, lbl in self._frozen_row_labels.items():
-                nd = self.sheet.get_display(0, c)
+                nd = self._get_display(0, 0, c)
                 if lbl.value != nd:
                     lbl.value = nd
             for pool_idx, (_, _, cell_pool) in enumerate(self._pool_rows):
-                r = row_start + pool_idx
-                if r >= self.sheet.rows:
+                abs_row = row_start + pool_idx
+                if abs_row >= self._n_rows():
                     break
                 for c, w in enumerate(cell_pool):
-                    nd = self.sheet.get_display(r, c)
+                    nd = self._get_display(pool_idx, abs_row, c)
                     if isinstance(w, widgets.Label):
                         if w.value != nd:
                             w.value = nd
@@ -681,7 +817,7 @@ class MiniExcelUI:
                         target = nd if nd in w.options else ""
                         if w.value != target:
                             w.value = target
-                    else:  # Text
+                    else:
                         if skip_selected and w._coords == self.selected:  # type: ignore[attr-defined]
                             continue
                         if w.value != nd:
@@ -697,7 +833,8 @@ class MiniExcelUI:
 
     def _on_apply_dropdown(self, _: Any) -> None:
         c = self._parse_col_input(self.dd_col_input)
-        if c is None: return
+        if c is None:
+            return
         items_str = self.dd_items_input.value.strip()
         if not items_str:
             self._set_status("Enter at least one item."); return
@@ -710,7 +847,8 @@ class MiniExcelUI:
 
     def _on_remove_dropdown(self, _: Any) -> None:
         c = self._parse_col_input(self.dd_col_input)
-        if c is None: return
+        if c is None:
+            return
         if c in self.col_dropdowns:
             del self.col_dropdowns[c]
             self._render_grid()
@@ -726,15 +864,17 @@ class MiniExcelUI:
 
     def _on_apply_col_width(self, _: Any) -> None:
         c = self._parse_col_input(self.cw_col_input)
-        if c is None: return
+        if c is None:
+            return
         px = self.cw_width_input.value
         self.col_widths[c] = px
-        self._apply_col_width(c, px)   # in-place, no rebuild
+        self._apply_col_width(c, px)
         self._set_status(f"Column {col_letter(c)} width set to {px}px.")
 
     def _on_reset_col_width(self, _: Any) -> None:
         c = self._parse_col_input(self.cw_col_input)
-        if c is None: return
+        if c is None:
+            return
         if c in self.col_widths:
             del self.col_widths[c]
             self._apply_col_width(c, 90)
@@ -750,7 +890,8 @@ class MiniExcelUI:
 
     def _on_hide_col(self, _: Any) -> None:
         c = self._parse_col_input(self.hc_col_input)
-        if c is None: return
+        if c is None:
+            return
         if c in self.hidden_cols:
             self._set_status(f"Column {col_letter(c)} is already hidden."); return
         self.hidden_cols.add(c)
@@ -759,14 +900,55 @@ class MiniExcelUI:
 
     def _on_unhide_col(self, _: Any) -> None:
         c = self._parse_col_input(self.hc_col_input)
-        if c is None: return
+        if c is None:
+            return
         if c not in self.hidden_cols:
             self._set_status(f"Column {col_letter(c)} is not hidden."); return
         self.hidden_cols.discard(c)
         self._apply_col_visibility(c, False)
         self._set_status(f"Column {col_letter(c)} restored.")
 
-    # ── Toolbar button handlers ────────────────────────────────────────────
+    # ── File load ──────────────────────────────────────────────────────────
+
+    def _init_df_mode(self, df: pd.DataFrame, path: str) -> None:
+        """Switch to DataFrame mode with the given DataFrame."""
+        self._df = df
+        self._edit_overlay = {}
+        self.page = 0
+        self.editable_cols.clear()
+        self.sheet = Spreadsheet(self.page_size, len(df.columns))
+        self._render_grid()
+        self._set_status(
+            f"Loaded {len(df):,} rows × {len(df.columns)} cols from {path}. "
+            "Use Column Edit to enable editing."
+        )
+
+    def _on_load_csv(self, _: Any) -> None:
+        raw  = self.path_input.value.strip()
+        path = raw if raw.lower().endswith(".csv") else (raw or "miniexcel_output") + ".csv"
+        self._set_status(f"Loading {path}…")
+        try:
+            df = pd.read_csv(path, dtype=str, keep_default_na=False)
+        except FileNotFoundError:
+            self._set_status(f"File not found: {path}"); return
+        except Exception as e:
+            self._set_status(f"Error loading {path}: {e}"); return
+        self._init_df_mode(df, path)
+
+    def _on_load_xlsx(self, _: Any) -> None:
+        raw  = self.path_input.value.strip()
+        path = raw if raw.lower().endswith(".xlsx") else (raw or "miniexcel_output") + ".xlsx"
+        self._set_status(f"Loading {path}…")
+        try:
+            df = pd.read_excel(path, dtype=str)
+            df = df.fillna("")
+        except FileNotFoundError:
+            self._set_status(f"File not found: {path}"); return
+        except Exception as e:
+            self._set_status(f"Error loading {path}: {e}"); return
+        self._init_df_mode(df, path)
+
+    # ── Paste load ─────────────────────────────────────────────────────────
 
     def _on_load_data(self, _: Any) -> None:
         text = self.input_area.value.strip()
@@ -777,6 +959,9 @@ class MiniExcelUI:
         rows = [row for row in reader if any(cell.strip() for cell in row)]
         if not rows:
             self._set_status("Could not parse data."); return
+        # Exit DataFrame mode — use the engine directly
+        self._df = None
+        self._edit_overlay = {}
         self.sheet.load_from_2d(rows)
         self.page = 0
         self.editable_cols.clear()
@@ -786,7 +971,11 @@ class MiniExcelUI:
             "Use Column Edit to enable editing."
         )
 
+    # ── Undo / Redo ────────────────────────────────────────────────────────
+
     def _on_undo(self, _: Any) -> None:
+        if self._df_mode:
+            self._set_status("Undo is not supported in file-load mode."); return
         prev_rows, prev_cols = self.sheet.rows, self.sheet.cols
         if self.sheet.undo():
             if self.sheet.rows != prev_rows or self.sheet.cols != prev_cols:
@@ -798,6 +987,8 @@ class MiniExcelUI:
             self._set_status("Nothing to undo.")
 
     def _on_redo(self, _: Any) -> None:
+        if self._df_mode:
+            self._set_status("Redo is not supported in file-load mode."); return
         prev_rows, prev_cols = self.sheet.rows, self.sheet.cols
         if self.sheet.redo():
             if self.sheet.rows != prev_rows or self.sheet.cols != prev_cols:
@@ -808,13 +999,19 @@ class MiniExcelUI:
         else:
             self._set_status("Nothing to redo.")
 
+    # ── Structural edits ───────────────────────────────────────────────────
+
     def _on_ins_row(self, _: Any) -> None:
+        if self._df_mode:
+            self._set_status("Row insert not supported in file-load mode."); return
         r, _ = self.selected
         self.sheet.insert_row(r)
         self._render_grid()
         self._set_status(f"Inserted row at {r + 1}.")
 
     def _on_del_row(self, _: Any) -> None:
+        if self._df_mode:
+            self._set_status("Row delete not supported in file-load mode."); return
         r, _ = self.selected
         self.sheet.delete_row(r)
         total = self._total_pages()
@@ -824,6 +1021,8 @@ class MiniExcelUI:
         self._set_status(f"Deleted row {r + 1}.")
 
     def _on_ins_col(self, _: Any) -> None:
+        if self._df_mode:
+            self._set_status("Column insert not supported in file-load mode."); return
         _, c = self.selected
         self.sheet.insert_col(c)
         self.editable_cols = {(x + 1 if x >= c else x) for x in self.editable_cols}
@@ -831,53 +1030,46 @@ class MiniExcelUI:
         self._set_status(f"Inserted column at {col_letter(c)}.")
 
     def _on_del_col(self, _: Any) -> None:
+        if self._df_mode:
+            self._set_status("Column delete not supported in file-load mode."); return
         _, c = self.selected
         self.sheet.delete_col(c)
         self.editable_cols = {(x - 1 if x > c else x) for x in self.editable_cols if x != c}
         self._render_grid()
         self._set_status(f"Deleted column {col_letter(c)}.")
 
+    # ── Save ───────────────────────────────────────────────────────────────
+
+    def _do_save(self, path: str, fmt: str) -> None:
+        if self._df_mode:
+            self._flush_page_edits()
+            df_save = self._df.copy()
+            for (abs_row, col), val in self._edit_overlay.items():
+                if abs_row < len(df_save) and col < df_save.shape[1]:
+                    df_save.iloc[abs_row, col] = val
+            if fmt == "CSV":
+                df_save.to_csv(path, index=False)
+            else:
+                df_save.to_excel(path, index=False)
+        else:
+            if fmt == "CSV":
+                self.sheet.save_csv(path)
+            else:
+                self.sheet.save_xlsx(path)
+
     def _on_save_csv(self, _: Any) -> None:
         path = (self.path_input.value or "miniexcel_output") + ".csv"
-        self.sheet.save_csv(path)
+        self._do_save(path, "CSV")
         self._set_status(f"Saved → {path}")
 
     def _on_save_xlsx(self, _: Any) -> None:
         path = (self.path_input.value or "miniexcel_output") + ".xlsx"
-        self.sheet.save_xlsx(path)
+        self._do_save(path, "XLSX")
         self._set_status(f"Saved → {path}")
 
-    def _on_load_csv(self, _: Any) -> None:
-        raw = self.path_input.value.strip()
-        path = raw if raw.lower().endswith(".csv") else (raw or "miniexcel_output") + ".csv"
-        try:
-            self.sheet.load_csv(path)
-        except FileNotFoundError:
-            self._set_status(f"File not found: {path}"); return
-        except Exception as e:
-            self._set_status(f"Error loading {path}: {e}"); return
-        self.page = 0
-        self.editable_cols.clear()
-        self._render_grid()
-        self._set_status(f"Loaded {self.sheet.rows} rows × {self.sheet.cols} cols from {path}. "
-                         "Use Column Edit to enable editing.")
-
-    def _on_load_xlsx(self, _: Any) -> None:
-        raw = self.path_input.value.strip()
-        path = raw if raw.lower().endswith(".xlsx") else (raw or "miniexcel_output") + ".xlsx"
-        try:
-            self.sheet.load_xlsx(path)
-        except FileNotFoundError:
-            self._set_status(f"File not found: {path}"); return
-        except Exception as e:
-            self._set_status(f"Error loading {path}: {e}"); return
-        self.page = 0
-        self.editable_cols.clear()
-        self._render_grid()
-        self._set_status(f"Loaded {self.sheet.rows} rows × {self.sheet.cols} cols from {path}. "
-                         "Use Column Edit to enable editing.")
-
     def _on_clear(self, _: Any) -> None:
+        self._df = None
+        self._edit_overlay = {}
         self.sheet = Spreadsheet(self.sheet.rows, self.sheet.cols)
         self.page = 0
         self.editable_cols.clear()
@@ -887,7 +1079,7 @@ class MiniExcelUI:
     # ── Public API ─────────────────────────────────────────────────────────
 
     def load_sample(self) -> None:
-        """Populate the sheet with built-in demo data."""
+        """Populate the sheet with built-in demo data (engine mode)."""
         sample = [
             ["Product", "Q1",   "Q2",   "Q3",   "Q4",   "Total",          "Avg"],
             ["Widgets", "1200", "1450", "1600", "1800", "=SUM(B2:E2)",   "=AVERAGE(B2:E2)"],
@@ -902,6 +1094,8 @@ class MiniExcelUI:
             ["Growth Q1→Q4 (Widgets)",   "=(E2-B2)/B2"],
             ["High performer?",          '=IF(F2>5000, "Yes", "No")'],
         ]
+        self._df = None
+        self._edit_overlay = {}
         self.sheet.load_from_2d(sample)
         self.page = 0
         self.editable_cols.clear()
@@ -915,7 +1109,6 @@ class MiniExcelUI:
     # ── Internal helpers ───────────────────────────────────────────────────
 
     def _parse_col_input(self, text_widget: widgets.Text) -> int | None:
-        """Parse a column letter from *text_widget*; emit a status message and return None on error."""
         col_str = text_widget.value.strip().upper()
         if not col_str:
             self._set_status("Enter a column letter (e.g. A)."); return None
@@ -923,8 +1116,10 @@ class MiniExcelUI:
             c = col_index(col_str)
         except Exception:
             self._set_status(f"Invalid column: {col_str!r}"); return None
-        if c >= self.sheet.cols:
-            self._set_status(f"Column {col_str} is out of range (sheet has {self.sheet.cols} columns).")
+        if c >= self._n_cols():
+            self._set_status(
+                f"Column {col_str} is out of range (sheet has {self._n_cols()} columns)."
+            )
             return None
         return c
 
