@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import csv
 import io
+import os
+from pathlib import Path
 from typing import Any
 
 import ipywidgets as widgets
@@ -923,29 +925,40 @@ class MiniExcelUI:
             "Use Column Edit to enable editing."
         )
 
+    def _resolve_path(self, raw: str, ext: str) -> str:
+        """Return an existing file path, trying cwd then this file's directory."""
+        name = raw if raw.lower().endswith(ext) else (raw or "miniexcel_output") + ext
+        if os.path.isfile(name):
+            return name
+        # Fallback: look next to mini_excel_ui.py
+        here = Path(__file__).parent / name
+        if here.is_file():
+            return str(here)
+        return name  # let the caller handle FileNotFoundError with original name
+
     def _on_load_csv(self, _: Any) -> None:
         raw  = self.path_input.value.strip()
-        path = raw if raw.lower().endswith(".csv") else (raw or "miniexcel_output") + ".csv"
+        path = self._resolve_path(raw, ".csv")
         self._set_status(f"Loading {path}…")
         try:
             df = pd.read_csv(path, dtype=str, keep_default_na=False)
         except FileNotFoundError:
-            self._set_status(f"File not found: {path}"); return
+            self._set_status(f"ERROR — File not found: {path}", error=True); return
         except Exception as e:
-            self._set_status(f"Error loading {path}: {e}"); return
+            self._set_status(f"ERROR loading {path}: {e}", error=True); return
         self._init_df_mode(df, path)
 
     def _on_load_xlsx(self, _: Any) -> None:
         raw  = self.path_input.value.strip()
-        path = raw if raw.lower().endswith(".xlsx") else (raw or "miniexcel_output") + ".xlsx"
+        path = self._resolve_path(raw, ".xlsx")
         self._set_status(f"Loading {path}…")
         try:
             df = pd.read_excel(path, dtype=str)
             df = df.fillna("")
         except FileNotFoundError:
-            self._set_status(f"File not found: {path}"); return
+            self._set_status(f"ERROR — File not found: {path}", error=True); return
         except Exception as e:
-            self._set_status(f"Error loading {path}: {e}"); return
+            self._set_status(f"ERROR loading {path}: {e}", error=True); return
         self._init_df_mode(df, path)
 
     # ── Paste load ─────────────────────────────────────────────────────────
@@ -1123,5 +1136,6 @@ class MiniExcelUI:
             return None
         return c
 
-    def _set_status(self, msg: str) -> None:
-        self.status.value = f'<span style="color:#333">{msg}</span>'
+    def _set_status(self, msg: str, error: bool = False) -> None:
+        color = "#c00" if error else "#333"
+        self.status.value = f'<span style="color:{color};font-weight:{"bold" if error else "normal"}">{msg}</span>'
