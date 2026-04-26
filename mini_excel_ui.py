@@ -146,17 +146,19 @@ class MiniExcelUI:
             placeholder="filename (no extension)",
             layout=widgets.Layout(width="220px"),
         )
-        self.save_csv_btn = widgets.Button(
-            description="Save CSV", layout=widgets.Layout(width="90px")
-        )
-        self.save_xlsx_btn = widgets.Button(
-            description="Save XLSX", layout=widgets.Layout(width="90px")
-        )
+        self.save_csv_btn  = widgets.Button(description="Save CSV",  layout=widgets.Layout(width="90px"))
+        self.save_xlsx_btn = widgets.Button(description="Save XLSX", layout=widgets.Layout(width="90px"))
+        self.load_csv_btn  = widgets.Button(description="Load CSV",  button_style="info", layout=widgets.Layout(width="90px"))
+        self.load_xlsx_btn = widgets.Button(description="Load XLSX", button_style="info", layout=widgets.Layout(width="90px"))
         self.save_csv_btn.on_click(self._on_save_csv)
         self.save_xlsx_btn.on_click(self._on_save_xlsx)
+        self.load_csv_btn.on_click(self._on_load_csv)
+        self.load_xlsx_btn.on_click(self._on_load_xlsx)
         toolbar1 = widgets.HBox(
-            [widgets.Label("Save as:", layout=widgets.Layout(width="60px")),
-             self.path_input, self.save_csv_btn, self.save_xlsx_btn]
+            [widgets.Label("File:", layout=widgets.Layout(width="35px")),
+             self.path_input,
+             self.save_csv_btn, self.save_xlsx_btn,
+             self.load_csv_btn, self.load_xlsx_btn]
         )
 
         # Row 2 — formula bar
@@ -844,6 +846,36 @@ class MiniExcelUI:
         path = (self.path_input.value or "miniexcel_output") + ".xlsx"
         self.sheet.save_xlsx(path)
         self._set_status(f"Saved → {path}")
+
+    def _on_load_csv(self, _: Any) -> None:
+        raw = self.path_input.value.strip()
+        path = raw if raw.lower().endswith(".csv") else (raw or "miniexcel_output") + ".csv"
+        try:
+            self.sheet.load_csv(path)
+        except FileNotFoundError:
+            self._set_status(f"File not found: {path}"); return
+        except Exception as e:
+            self._set_status(f"Error loading {path}: {e}"); return
+        self.page = 0
+        self.editable_cols.clear()
+        self._render_grid()
+        self._set_status(f"Loaded {self.sheet.rows} rows × {self.sheet.cols} cols from {path}. "
+                         "Use Column Edit to enable editing.")
+
+    def _on_load_xlsx(self, _: Any) -> None:
+        raw = self.path_input.value.strip()
+        path = raw if raw.lower().endswith(".xlsx") else (raw or "miniexcel_output") + ".xlsx"
+        try:
+            self.sheet.load_xlsx(path)
+        except FileNotFoundError:
+            self._set_status(f"File not found: {path}"); return
+        except Exception as e:
+            self._set_status(f"Error loading {path}: {e}"); return
+        self.page = 0
+        self.editable_cols.clear()
+        self._render_grid()
+        self._set_status(f"Loaded {self.sheet.rows} rows × {self.sheet.cols} cols from {path}. "
+                         "Use Column Edit to enable editing.")
 
     def _on_clear(self, _: Any) -> None:
         self.sheet = Spreadsheet(self.sheet.rows, self.sheet.cols)
