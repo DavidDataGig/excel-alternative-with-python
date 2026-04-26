@@ -1,27 +1,17 @@
-"""
-Spreadsheet Engine - the brain behind the ipywidgets Excel alternative.
-Separated from the UI so it can be unit-tested without a Jupyter kernel.
+"""Spreadsheet backend: formula evaluation, cell dependency tracking, and data I/O."""
 
-Supports:
-- Cell storage with formulas and values
-- Formula parser for =SUM, =AVERAGE, =MIN, =MAX, =COUNT, =IF, arithmetic, cell references, ranges
-- A1 <-> (row,col) conversion
-- Load/save CSV and XLSX
-- Dependency tracking for recalc
-- Undo/redo history
-"""
 from __future__ import annotations
-import re
-import csv
-import copy
-from typing import Any
 
-# ---------- A1 notation helpers ----------
+import csv
+import re
+from typing import Any, Callable
+
+# ── Cell-address helpers ───────────────────────────────────────────────────────
+
 
 def col_letter(col: int) -> str:
-    """0-indexed column number -> Excel letter (0='A', 25='Z', 26='AA')."""
-    s = ""
-    n = col
+    """Zero-based column index → Excel-style letter(s).  0 → 'A', 26 → 'AA'."""
+    s, n = "", col
     while True:
         s = chr(ord("A") + n % 26) + s
         n = n // 26 - 1
@@ -29,69 +19,68 @@ def col_letter(col: int) -> str:
             break
     return s
 
+
 def col_index(letters: str) -> int:
-    """'A' -> 0, 'Z' -> 25, 'AA' -> 26."""
+    """Excel-style column letters → zero-based index.  'A' → 0, 'AA' → 26."""
     n = 0
     for ch in letters.upper():
         n = n * 26 + (ord(ch) - ord("A") + 1)
     return n - 1
 
+
 def a1_to_rc(ref: str) -> tuple[int, int]:
-    """'B3' -> (2, 1) as (row, col) 0-indexed."""
+    """Parse an A1-style reference to a (row, col) zero-based pair."""
     m = re.fullmatch(r"([A-Za-z]+)(\d+)", ref.strip())
     if not m:
         raise ValueError(f"Bad cell reference: {ref}")
     letters, digits = m.groups()
     return int(digits) - 1, col_index(letters)
 
+
 def rc_to_a1(row: int, col: int) -> str:
+    """Convert a (row, col) zero-based pair to an A1-style string."""
     return f"{col_letter(col)}{row + 1}"
 
 
-# ---------- Formula evaluator ----------
+# ── Formula evaluation ─────────────────────────────────────────────────────────
+
+CellKey = tuple[int, int]
+
 
 class FormulaError(Exception):
-    pass
+    """Raised when a formula cannot be evaluated."""
 
-# Functions we support. Operate on an already-flattened list of numeric values.
-FUNCTIONS: dict[str, Any] = {
-    "SUM":     lambda xs: sum(xs),
-    "AVERAGE": lambda xs: (sum(xs) / len(xs)) if xs else FormulaError("#DIV/0!"),
-    "MIN":     lambda xs: min(xs) if xs else FormulaError("#VALUE!"),
-    "MAX":     lambda xs: max(xs) if xs else FormulaError("#VALUE!"),
-    "COUNT":   lambda xs: len(xs),
-    "PRODUCT": lambda xs: _product(xs),
-    "ABS":     lambda xs: abs(xs[0]) if len(xs) == 1 else FormulaError("#VALUE!"),
-    "ROUND":   lambda xs: round(xs[0], int(xs[1])) if len(xs) == 2 else FormulaError("#VALUE!"),
-}
 
-def _product(xs):
-    p = 1
+def _product(xs: list[float]) -> float:
+    p = 1.0
     for x in xs:
         p *= x
     return p
 
 
+FUNCTIONS: dict[str, Callable[[list[float]], Any]] = {
+    "SUM":     lambda xs: sum(xs),
+    "AVERAGE": lambda xs: (sum(xs) / len(xs)) if xs else FormulaError("#DIV/0!"),
+    "MIN":     lambda xs: min(xs) if xs else FormulaError("#VALUE!"),
+    "MAX":     lambda xs: max(xs) if xs else FormulaError("#VALUE!"),
+    "COUNT":   lambda xs: float(len(xs)),
+    "PRODUCT": _product,
+    "ABS":     lambda xs: abs(xs[0]) if len(xs) == 1 else FormulaError("#VALUE!"),
+    "ROUND":   lambda xs: round(xs[0], int(xs[1])) if len(xs) == 2 else FormulaError("#VALUE!"),
+}
+
+
 class Evaluator:
-    """
-    Recursive-descent evaluator for a small subset of Excel formula grammar.
+    """Recursive-descent parser and evaluator for spreadsheet formula strings."""
 
-    Grammar (informal):
-        expr       := term (('+'|'-') term)*
-        term       := power (('*'|'/') power)*
-        power      := factor ('^' factor)?
-        factor     := NUMBER | STRING | CELLREF | RANGE | FUNC '(' args ')' | '(' expr ')' | '-' factor
-        args       := expr (',' expr)*   (for IF we allow bool-like first arg)
-        CELLREF    := [A-Z]+[0-9]+
-        RANGE      := CELLREF ':' CELLREF
-    """
-
-    def __init__(self, get_cell):
-        # get_cell(row, col) -> value (number, string, or None)
+    def __init__(self, get_cell: Callable[[int, int], Any]) -> None:
         self.get_cell = get_cell
-        self.deps: set[tuple[int, int]] = set()
+        self.deps: set[CellKey] = set()
+        self.tokens: list[tuple[str, Any]] = []
+        self.pos: int = 0
 
     def evaluate(self, text: str) -> Any:
+        """Parse and evaluate *text* (the formula body, without the leading '=')."""
         self.deps = set()
         self.tokens = self._tokenize(text)
         self.pos = 0
@@ -100,9 +89,10 @@ class Evaluator:
             raise FormulaError("#SYNTAX")
         return result
 
-    # Tokenizer
-    def _tokenize(self, s: str):
-        tokens = []
+    # ── Tokeniser ──────────────────────────────────────────────────────────
+
+    def _tokenize(self, s: str) -> list[tuple[str, Any]]:
+        tokens: list[tuple[str, Any]] = []
         i = 0
         while i < len(s):
             c = s[i]
@@ -118,23 +108,21 @@ class Evaluator:
                 j = i + 1
                 while j < len(s) and s[j] != '"':
                     j += 1
-                tokens.append(("STR", s[i + 1:j]))
+                tokens.append(("STR", s[i + 1 : j]))
                 i = j + 1
             elif c.isalpha():
                 j = i
                 while j < len(s) and (s[j].isalnum() or s[j] == "_"):
                     j += 1
-                word = s[i:j]
-                # Is it a cell ref like A1, range start, or a function name?
-                if re.fullmatch(r"[A-Za-z]+\d+", word):
-                    tokens.append(("REF", word.upper()))
-                elif word.upper() in ("TRUE", "FALSE"):
-                    tokens.append(("BOOL", word.upper() == "TRUE"))
+                w = s[i:j]
+                if re.fullmatch(r"[A-Za-z]+\d+", w):
+                    tokens.append(("REF", w.upper()))
+                elif w.upper() in ("TRUE", "FALSE"):
+                    tokens.append(("BOOL", w.upper() == "TRUE"))
                 else:
-                    tokens.append(("FUNC", word.upper()))
+                    tokens.append(("FUNC", w.upper()))
                 i = j
             elif c in "+-*/^(),:<>=":
-                # Handle 2-char operators: <=, >=, <>
                 if c in "<>" and i + 1 < len(s) and s[i + 1] == "=":
                     tokens.append(("OP", c + "="))
                     i += 2
@@ -148,40 +136,35 @@ class Evaluator:
                 raise FormulaError(f"#SYNTAX: unexpected '{c}'")
         return tokens
 
-    def _peek(self, offset=0):
-        if self.pos + offset < len(self.tokens):
-            return self.tokens[self.pos + offset]
-        return (None, None)
+    # ── Parser helpers ─────────────────────────────────────────────────────
 
-    def _eat(self):
-        tok = self.tokens[self.pos]
+    def _peek(self, offset: int = 0) -> tuple[str | None, Any]:
+        idx = self.pos + offset
+        return self.tokens[idx] if idx < len(self.tokens) else (None, None)
+
+    def _eat(self) -> tuple[str, Any]:
+        t = self.tokens[self.pos]
         self.pos += 1
-        return tok
+        return t
 
-    def _match(self, kind, value=None):
+    def _match(self, kind: str, val: Any = None) -> tuple[str, Any] | None:
         t = self._peek()
-        if t[0] == kind and (value is None or t[1] == value):
+        if t[0] == kind and (val is None or t[1] == val):
             return self._eat()
         return None
 
-    # expr := compare (for IF-like comparisons)
-    def _expr(self):
+    # ── Grammar (precedence climbing) ──────────────────────────────────────
+
+    def _expr(self) -> Any:
         left = self._additive()
         while self._peek()[0] == "OP" and self._peek()[1] in ("=", "<>", "<", ">", "<=", ">="):
             op = self._eat()[1]
             right = self._additive()
-            left = self._compare(left, op, right)
+            left = {"=": left == right, "<>": left != right, "<": left < right,
+                    ">": left > right, "<=": left <= right, ">=": left >= right}[op]
         return left
 
-    def _compare(self, a, op, b):
-        if op == "=":  return a == b
-        if op == "<>": return a != b
-        if op == "<":  return a < b
-        if op == ">":  return a > b
-        if op == "<=": return a <= b
-        if op == ">=": return a >= b
-
-    def _additive(self):
+    def _additive(self) -> Any:
         left = self._term()
         while self._peek()[0] == "OP" and self._peek()[1] in ("+", "-"):
             op = self._eat()[1]
@@ -189,7 +172,7 @@ class Evaluator:
             left = (self._num(left) + self._num(right)) if op == "+" else (self._num(left) - self._num(right))
         return left
 
-    def _term(self):
+    def _term(self) -> Any:
         left = self._power()
         while self._peek()[0] == "OP" and self._peek()[1] in ("*", "/"):
             op = self._eat()[1]
@@ -203,15 +186,14 @@ class Evaluator:
                 left = self._num(left) / r
         return left
 
-    def _power(self):
+    def _power(self) -> Any:
         left = self._factor()
         if self._peek()[0] == "OP" and self._peek()[1] == "^":
             self._eat()
-            right = self._factor()
-            return self._num(left) ** self._num(right)
+            return self._num(left) ** self._num(self._factor())
         return left
 
-    def _factor(self):
+    def _factor(self) -> Any:
         t = self._peek()
         if t[0] == "OP" and t[1] == "-":
             self._eat()
@@ -232,20 +214,19 @@ class Evaluator:
                 raise FormulaError("#SYNTAX: missing )")
             return v
         if t[0] == "REF":
-            # Could be single ref OR start of range
-            ref1 = self._eat()[1]
+            r1 = self._eat()[1]
             if self._peek()[0] == "OP" and self._peek()[1] == ":":
                 self._eat()
                 if self._peek()[0] != "REF":
-                    raise FormulaError("#SYNTAX: expected cell after ':'")
-                ref2 = self._eat()[1]
-                return self._resolve_range(ref1, ref2)
-            return self._resolve_cell(ref1)
+                    raise FormulaError("#SYNTAX")
+                r2 = self._eat()[1]
+                return self._resolve_range(r1, r2)
+            return self._resolve_cell(r1)
         if t[0] == "FUNC":
             name = self._eat()[1]
             if not self._match("OP", "("):
                 raise FormulaError(f"#NAME?: {name}")
-            args = []
+            args: list[Any] = []
             if not (self._peek()[0] == "OP" and self._peek()[1] == ")"):
                 args.append(self._expr())
                 while self._peek()[0] == "OP" and self._peek()[1] == ",":
@@ -256,56 +237,52 @@ class Evaluator:
             return self._call(name, args)
         raise FormulaError("#SYNTAX: unexpected token")
 
-    def _resolve_cell(self, ref):
-        row, col = a1_to_rc(ref)
-        self.deps.add((row, col))
-        v = self.get_cell(row, col)
+    # ── Reference resolution ───────────────────────────────────────────────
+
+    def _resolve_cell(self, ref: str) -> Any:
+        r, c = a1_to_rc(ref)
+        self.deps.add((r, c))
+        v = self.get_cell(r, c)
         if v is None or v == "":
-            return 0  # Excel treats empty cells as 0 in arithmetic
+            return 0
         if isinstance(v, str):
-            # Try to parse a number from the string
             try:
                 return float(v)
             except ValueError:
                 return v
         return v
 
-    def _resolve_range(self, r1, r2):
+    def _resolve_range(self, r1: str, r2: str) -> list[float]:
         rr1, cc1 = a1_to_rc(r1)
         rr2, cc2 = a1_to_rc(r2)
-        r_start, r_end = min(rr1, rr2), max(rr1, rr2)
-        c_start, c_end = min(cc1, cc2), max(cc1, cc2)
-        values = []
-        for r in range(r_start, r_end + 1):
-            for c in range(c_start, c_end + 1):
+        rs, re_ = min(rr1, rr2), max(rr1, rr2)
+        cs, ce = min(cc1, cc2), max(cc1, cc2)
+        vals: list[float] = []
+        for r in range(rs, re_ + 1):
+            for c in range(cs, ce + 1):
                 self.deps.add((r, c))
                 v = self.get_cell(r, c)
                 if v is None or v == "":
                     continue
                 if isinstance(v, (int, float)):
-                    values.append(float(v))
+                    vals.append(float(v))
                 elif isinstance(v, str):
                     try:
-                        values.append(float(v))
+                        vals.append(float(v))
                     except ValueError:
                         pass
-        return values  # ranges return lists; functions will flatten
+        return vals
 
-    def _call(self, name, args):
-        # Special-case IF because it expects exactly 3 args and the first is a bool
+    def _call(self, name: str, args: list[Any]) -> Any:
         if name == "IF":
             if len(args) != 3:
-                raise FormulaError("#VALUE!: IF needs 3 args")
-            cond = args[0]
-            if isinstance(cond, list):  # a range used as a bool is weird; take truthy length
-                cond = bool(cond)
-            return args[1] if cond else args[2]
-        if name == "CONCAT" or name == "CONCATENATE":
+                raise FormulaError("#VALUE!")
+            return args[1] if args[0] else args[2]
+        if name in ("CONCAT", "CONCATENATE"):
             return "".join(str(a) for a in args)
         if name not in FUNCTIONS:
             raise FormulaError(f"#NAME?: {name}")
-        # Flatten args: ranges are lists; singletons become single-element lists
-        flat = []
+        flat: list[float] = []
         for a in args:
             if isinstance(a, list):
                 flat.extend(a)
@@ -315,7 +292,7 @@ class Evaluator:
                 try:
                     flat.append(float(a))
                 except ValueError:
-                    pass  # skip non-numeric strings, matches Excel SUM behavior
+                    pass
             elif isinstance(a, bool):
                 flat.append(1.0 if a else 0.0)
         result = FUNCTIONS[name](flat)
@@ -323,38 +300,44 @@ class Evaluator:
             raise result
         return result
 
-    def _num(self, v):
+    def _num(self, v: Any) -> float:
         if isinstance(v, bool):
-            return 1 if v else 0
+            return 1.0 if v else 0.0
         if isinstance(v, (int, float)):
-            return v
+            return float(v)
         if isinstance(v, str):
             try:
                 return float(v)
             except ValueError:
                 raise FormulaError("#VALUE!")
         if isinstance(v, list):
-            raise FormulaError("#VALUE!: range in arithmetic")
+            raise FormulaError("#VALUE!")
         raise FormulaError("#VALUE!")
 
 
-# ---------- The Spreadsheet itself ----------
+# ── Spreadsheet model ──────────────────────────────────────────────────────────
+
 
 class Spreadsheet:
-    def __init__(self, rows: int = 20, cols: int = 10):
+    """
+    In-memory spreadsheet with formula evaluation, dependency tracking,
+    and undo/redo support.
+    """
+
+    def __init__(self, rows: int = 20, cols: int = 10) -> None:
         self.rows = rows
         self.cols = cols
-        # Two parallel maps: raw (formulas as typed) and computed (evaluated values)
-        self.raw: dict[tuple[int, int], str] = {}
-        self.values: dict[tuple[int, int], Any] = {}
-        self.deps_of: dict[tuple[int, int], set[tuple[int, int]]] = {}  # cell -> cells it depends on
-        self.dependents: dict[tuple[int, int], set[tuple[int, int]]] = {}  # cell -> cells that depend on it
+        self.raw: dict[CellKey, str] = {}
+        self.values: dict[CellKey, Any] = {}
+        self.deps_of: dict[CellKey, set[CellKey]] = {}
+        self.dependents: dict[CellKey, set[CellKey]] = {}
         self._history: list[dict] = []
         self._future: list[dict] = []
         self._history_limit = 50
 
-    # ----- snapshot helpers for undo/redo -----
-    def _snapshot(self):
+    # ── Snapshot / restore ─────────────────────────────────────────────────
+
+    def _snapshot(self) -> dict:
         return {
             "raw": dict(self.raw),
             "values": dict(self.values),
@@ -364,21 +347,21 @@ class Spreadsheet:
             "cols": self.cols,
         }
 
-    def _restore(self, snap):
-        self.raw = dict(snap["raw"])
-        self.values = dict(snap["values"])
-        self.deps_of = {k: set(v) for k, v in snap["deps_of"].items()}
-        self.dependents = {k: set(v) for k, v in snap["dependents"].items()}
-        self.rows = snap["rows"]
-        self.cols = snap["cols"]
+    def _restore(self, s: dict) -> None:
+        self.raw = dict(s["raw"])
+        self.values = dict(s["values"])
+        self.deps_of = {k: set(v) for k, v in s["deps_of"].items()}
+        self.dependents = {k: set(v) for k, v in s["dependents"].items()}
+        self.rows, self.cols = s["rows"], s["cols"]
 
-    def _push_history(self):
+    def _push(self) -> None:
         self._history.append(self._snapshot())
         if len(self._history) > self._history_limit:
             self._history.pop(0)
         self._future.clear()
 
     def undo(self) -> bool:
+        """Revert to the previous state. Returns True if successful."""
         if not self._history:
             return False
         self._future.append(self._snapshot())
@@ -386,162 +369,143 @@ class Spreadsheet:
         return True
 
     def redo(self) -> bool:
+        """Re-apply a previously undone state. Returns True if successful."""
         if not self._future:
             return False
         self._history.append(self._snapshot())
         self._restore(self._future.pop())
         return True
 
-    # ----- core cell operations -----
-    def set_cell(self, row: int, col: int, text: str, record_history: bool = True):
-        if record_history:
-            self._push_history()
-        key = (row, col)
-        # Clear old dependency edges
-        if key in self.deps_of:
-            for dep in self.deps_of[key]:
-                self.dependents.get(dep, set()).discard(key)
-            del self.deps_of[key]
+    # ── Cell mutation ──────────────────────────────────────────────────────
 
+    def set_cell(self, row: int, col: int, text: str, record_history: bool = True) -> None:
+        """Write raw content to a cell and propagate recalculation."""
+        if record_history:
+            self._push()
+        key: CellKey = (row, col)
+        if key in self.deps_of:
+            for d in self.deps_of[key]:
+                self.dependents.get(d, set()).discard(key)
+            del self.deps_of[key]
         if text is None or text == "":
             self.raw.pop(key, None)
             self.values.pop(key, None)
         else:
             self.raw[key] = text
+        self._recalc(row, col)
+        self._recalc_deps(key)
 
-        self._recalc_cell(row, col)
-        # Recalc everything that depends on this cell (transitively)
-        self._recalc_dependents(key)
-
-    def _recalc_cell(self, row: int, col: int):
-        key = (row, col)
+    def _recalc(self, row: int, col: int) -> None:
+        key: CellKey = (row, col)
         text = self.raw.get(key, "")
         if text == "":
             self.values.pop(key, None)
             return
         if isinstance(text, str) and text.startswith("="):
-            evaluator = Evaluator(lambda r, c: self.values.get((r, c)))
+            ev = Evaluator(lambda r, c: self.values.get((r, c)))
             try:
-                result = evaluator.evaluate(text[1:])
+                result = ev.evaluate(text[1:])
                 if isinstance(result, list):
-                    # A formula that returns a raw range - show first element or error
                     result = result[0] if result else ""
                 self.values[key] = result
-                # Save new dependency edges
-                self.deps_of[key] = evaluator.deps
-                for dep in evaluator.deps:
-                    self.dependents.setdefault(dep, set()).add(key)
+                self.deps_of[key] = ev.deps
+                for d in ev.deps:
+                    self.dependents.setdefault(d, set()).add(key)
             except FormulaError as e:
                 self.values[key] = str(e)
             except Exception:
                 self.values[key] = "#ERROR!"
         else:
-            # Try numeric parse; otherwise keep as string
             try:
-                self.values[key] = float(text) if "." in text or "e" in text.lower() else int(text)
+                self.values[key] = (
+                    float(text) if ("." in text or "e" in text.lower()) else int(text)
+                )
             except (ValueError, TypeError):
                 self.values[key] = text
 
-    def _recalc_dependents(self, key):
-        # BFS over dependents, guarding against cycles
-        visited = set()
+    def _recalc_deps(self, key: CellKey) -> None:
+        seen: set[CellKey] = set()
         queue = list(self.dependents.get(key, set()))
         while queue:
-            cell = queue.pop(0)
-            if cell in visited:
+            c = queue.pop(0)
+            if c in seen:
                 continue
-            visited.add(cell)
-            self._recalc_cell(*cell)
-            queue.extend(self.dependents.get(cell, set()))
+            seen.add(c)
+            self._recalc(*c)
+            queue.extend(self.dependents.get(c, set()))
 
-    def recalculate_all(self):
-        """Recompute every formula in dependency order (approximate via iteration)."""
-        # Simple fixed-point: iterate up to N passes until values stop changing.
+    def recalculate_all(self) -> None:
+        """Multi-pass recalculation to resolve inter-cell dependencies."""
         for _ in range(5):
             changed = False
-            for key in list(self.raw.keys()):
-                before = self.values.get(key)
-                self._recalc_cell(*key)
-                if self.values.get(key) != before:
+            for k in list(self.raw.keys()):
+                before = self.values.get(k)
+                self._recalc(*k)
+                if self.values.get(k) != before:
                     changed = True
             if not changed:
                 break
 
-    # ----- reading -----
-    def get_raw(self, row: int, col: int) -> str:
-        return self.raw.get((row, col), "")
+    # ── Cell read accessors ────────────────────────────────────────────────
 
-    def get_value(self, row: int, col: int):
-        return self.values.get((row, col), "")
+    def get_raw(self, r: int, c: int) -> str:
+        return self.raw.get((r, c), "")
 
-    def get_display(self, row: int, col: int) -> str:
-        v = self.values.get((row, col), "")
+    def get_value(self, r: int, c: int) -> Any:
+        return self.values.get((r, c), "")
+
+    def get_display(self, r: int, c: int) -> str:
+        """Return a display-ready string for the computed cell value."""
+        v = self.values.get((r, c), "")
         if isinstance(v, float):
-            # Tidy float formatting: drop trailing .0 for whole numbers
-            if v.is_integer():
-                return str(int(v))
-            return f"{v:g}"
+            return str(int(v)) if v.is_integer() else f"{v:g}"
         return str(v)
 
-    # ----- structural ops -----
-    def insert_row(self, at: int):
-        self._push_history()
-        # Shift rows >= at down by 1
-        new_raw = {}
-        for (r, c), v in self.raw.items():
-            new_raw[(r + 1 if r >= at else r, c)] = v
-        self.raw = new_raw
+    # ── Structural mutations ───────────────────────────────────────────────
+
+    def insert_row(self, at: int) -> None:
+        self._push()
+        self.raw = {((r + 1 if r >= at else r), c): v for (r, c), v in self.raw.items()}
         self.rows += 1
-        self._rebuild_values()
+        self._rebuild()
 
-    def delete_row(self, at: int):
-        self._push_history()
-        new_raw = {}
-        for (r, c), v in self.raw.items():
-            if r == at:
-                continue
-            new_raw[(r - 1 if r > at else r, c)] = v
-        self.raw = new_raw
+    def delete_row(self, at: int) -> None:
+        self._push()
+        self.raw = {((r - 1 if r > at else r), c): v for (r, c), v in self.raw.items() if r != at}
         self.rows = max(1, self.rows - 1)
-        self._rebuild_values()
+        self._rebuild()
 
-    def insert_col(self, at: int):
-        self._push_history()
-        new_raw = {}
-        for (r, c), v in self.raw.items():
-            new_raw[(r, c + 1 if c >= at else c)] = v
-        self.raw = new_raw
+    def insert_col(self, at: int) -> None:
+        self._push()
+        self.raw = {(r, (c + 1 if c >= at else c)): v for (r, c), v in self.raw.items()}
         self.cols += 1
-        self._rebuild_values()
+        self._rebuild()
 
-    def delete_col(self, at: int):
-        self._push_history()
-        new_raw = {}
-        for (r, c), v in self.raw.items():
-            if c == at:
-                continue
-            new_raw[(r, c - 1 if c > at else c)] = v
-        self.raw = new_raw
+    def delete_col(self, at: int) -> None:
+        self._push()
+        self.raw = {(r, (c - 1 if c > at else c)): v for (r, c), v in self.raw.items() if c != at}
         self.cols = max(1, self.cols - 1)
-        self._rebuild_values()
+        self._rebuild()
 
-    def _rebuild_values(self):
+    def _rebuild(self) -> None:
         self.values.clear()
         self.deps_of.clear()
         self.dependents.clear()
-        for key in list(self.raw.keys()):
-            self._recalc_cell(*key)
+        for k in list(self.raw.keys()):
+            self._recalc(*k)
         self.recalculate_all()
 
-    # ----- I/O -----
-    def load_from_2d(self, data: list[list]):
+    # ── Bulk load ──────────────────────────────────────────────────────────
+
+    def load_from_2d(self, data: list[list[Any]]) -> None:
+        """Replace all content with a 2-D list of raw values."""
         self.raw.clear()
         self.values.clear()
         self.deps_of.clear()
         self.dependents.clear()
         if data:
             self.rows = max(self.rows, len(data))
-            self.cols = max(self.cols, max(len(row) for row in data))
+            self.cols = max(self.cols, max(len(r) for r in data))
         for r, row in enumerate(data):
             for c, val in enumerate(row):
                 if val is None or val == "":
@@ -551,39 +515,30 @@ class Spreadsheet:
         self._history.clear()
         self._future.clear()
 
-    def to_2d(self, use_values: bool = True) -> list[list]:
-        out = [["" for _ in range(self.cols)] for _ in range(self.rows)]
-        source = self.values if use_values else self.raw
-        for (r, c), v in source.items():
+    # ── CSV / XLSX I/O ─────────────────────────────────────────────────────
+
+    def save_csv(self, path: str) -> None:
+        data = [["" for _ in range(self.cols)] for _ in range(self.rows)]
+        for (r, c), v in self.values.items():
             if r < self.rows and c < self.cols:
-                out[r][c] = v
-        return out
-
-    def save_csv(self, path: str):
-        data = self.to_2d(use_values=True)
+                data[r][c] = v
         with open(path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerows(data)
+            csv.writer(f).writerows(data)
 
-    def load_csv(self, path: str):
+    def load_csv(self, path: str) -> None:
         with open(path, newline="") as f:
-            rows = list(csv.reader(f))
-        self.load_from_2d(rows)
+            self.load_from_2d(list(csv.reader(f)))
 
-    def save_xlsx(self, path: str):
+    def save_xlsx(self, path: str) -> None:
         from openpyxl import Workbook
         wb = Workbook()
         ws = wb.active
         for (r, c), text in self.raw.items():
-            # openpyxl uses 1-indexed
             ws.cell(row=r + 1, column=c + 1, value=text)
         wb.save(path)
 
-    def load_xlsx(self, path: str):
+    def load_xlsx(self, path: str) -> None:
         from openpyxl import load_workbook
         wb = load_workbook(path)
         ws = wb.active
-        data = []
-        for row in ws.iter_rows(values_only=True):
-            data.append(list(row))
-        self.load_from_2d(data)
+        self.load_from_2d([list(row) for row in ws.iter_rows(values_only=True)])
